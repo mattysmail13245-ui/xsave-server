@@ -57,6 +57,25 @@ app.post('/cookies', (req, res) => {
   res.json({ ok: true });
 });
 
+app.get('/cookies/check', (_, res) => {
+  if (!fs.existsSync(COOKIES_PATH)) return res.json({ ok: false, msg: 'Keine Cookies gespeichert' });
+  const content = fs.readFileSync(COOKIES_PATH, 'utf8');
+  const lines = content.split('\n').filter(l => l.trim() && !l.startsWith('#'));
+  const twitterLines = lines.filter(l => l.includes('twitter.com') || l.includes('x.com'));
+  const hasAuth = content.includes('auth_token');
+  const hasCt0 = content.includes('ct0');
+  res.json({
+    ok: twitterLines.length > 0,
+    totalLines: lines.length,
+    twitterLines: twitterLines.length,
+    hasAuth,
+    hasCt0,
+    msg: twitterLines.length > 0
+      ? (hasAuth && hasCt0 ? 'Cookies OK — auth_token + ct0 gefunden' : 'Cookies unvollständig — auth_token oder ct0 fehlt')
+      : 'Keine Twitter-Cookies gefunden'
+  });
+});
+
 app.get('/cookies/status', (_, res) => {
   res.json({ active: fs.existsSync(COOKIES_PATH) });
 });
@@ -371,9 +390,11 @@ body{background:var(--bg);color:var(--text);font-family:'Geist',-apple-system,sa
       <li>Kopiere den gesamten Text und füge ihn hier ein</li>
     </ol>
     <textarea id="cookieTxt" placeholder="# Netscape HTTP Cookie File&#10;.twitter.com TRUE / FALSE ..."></textarea>
+    <div id="cookieStatus" style="font-size:12px;padding:8px 12px;border-radius:8px;background:#1a1a1a;margin-bottom:10px;display:none"></div>
     <div class="modal-row">
       <button class="mbtn sec" onclick="closeModal()">Abbrechen</button>
       <button class="mbtn sec" onclick="deleteCookies()" id="delBtn" style="display:none">🗑 Entfernen</button>
+      <button class="mbtn sec" onclick="checkCookieFormat()" id="checkBtn" style="display:none">🔍 Prüfen</button>
       <button class="mbtn pri" onclick="saveCookies()">Speichern</button>
     </div>
   </div>
@@ -570,6 +591,7 @@ async function checkCookies() {
     const d = await r.json();
     document.getElementById('cdot').classList.toggle('on', d.active);
     document.getElementById('delBtn').style.display = d.active ? 'flex':'none';
+    document.getElementById('checkBtn').style.display = d.active ? 'flex':'none';
   } catch {}
 }
 
@@ -593,6 +615,21 @@ async function saveCookies() {
     const d = await r.json();
     if (d.ok) { closeModal(); checkCookies(); document.getElementById('cookieTxt').value=''; }
   } catch(e) { alert('Fehler: '+e.message); }
+}
+
+async function checkCookieFormat() {
+  const statusEl = document.getElementById('cookieStatus');
+  statusEl.style.display = 'block';
+  statusEl.textContent = 'Prüfe…';
+  try {
+    const r = await apiFetch('/cookies/check');
+    const d = await r.json();
+    statusEl.style.color = d.ok ? '#00e87a' : '#ff3b3b';
+    statusEl.textContent = d.msg + (d.twitterLines ? ' (' + d.twitterLines + ' Twitter-Einträge)' : '');
+  } catch(e) {
+    statusEl.style.color = '#ff3b3b';
+    statusEl.textContent = 'Fehler: ' + e.message;
+  }
 }
 
 async function deleteCookies() {
