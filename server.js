@@ -11,6 +11,27 @@ const COOKIES_PATH = '/tmp/cookies.txt';
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 
+// ── Password protection ───────────────────────────────────────────
+const APP_PASSWORD = process.env.APP_PASSWORD || 'xload';
+
+app.use((req, res, next) => {
+  // Allow health check without auth
+  if (req.path === '/health') return next();
+  // Allow GET / (the HTML page itself)
+  if (req.method === 'GET' && req.path === '/') return next();
+  // Check session cookie
+  const sessionCookie = req.headers.cookie?.split(';').find(c => c.trim().startsWith('xs_session='));
+  if (sessionCookie) {
+    const val = sessionCookie.split('=')[1]?.trim();
+    if (val === APP_PASSWORD) return next();
+  }
+  // Check Authorization header (for API calls from PWA)
+  const auth = req.headers['x-password'];
+  if (auth === APP_PASSWORD) return next();
+  // Not authenticated
+  res.status(401).json({ error: 'Nicht autorisiert' });
+});
+
 // ── Cookie helpers ────────────────────────────────────────────────
 function getCookieArgs() {
   if (fs.existsSync(COOKIES_PATH)) return `--cookies "${COOKIES_PATH}"`;
@@ -102,8 +123,9 @@ app.post('/playlist', async (req, res) => {
 
 // ── GET /download ─────────────────────────────────────────────────
 app.get('/download', (req, res) => {
-  const { url, direct } = req.query;
+  const { url, direct, pw } = req.query;
   if (!url) return res.status(400).send('Keine URL');
+  if (pw !== APP_PASSWORD) return res.status(401).send('Nicht autorisiert');
 
   res.setHeader('Content-Disposition', 'attachment; filename="xload.mp4"');
   res.setHeader('Content-Type', 'video/mp4');
@@ -362,6 +384,25 @@ const S = window.location.origin;
 let tab = 'video';
 let _obs = null;
 
+// ── Password ───────────────────────────────────────────────────────
+let _pw = localStorage.getItem('xs_pw') || '';
+
+function apiFetch(path, opts={}) {
+  if (!_pw) {
+    _pw = prompt('XLoad Passwort:') || '';
+    localStorage.setItem('xs_pw', _pw);
+  }
+  opts.headers = { ...(opts.headers||{}), 'x-password': _pw, 'Content-Type': 'application/json' };
+  return fetch(S + path, opts).then(async r => {
+    if (r.status === 401) {
+      _pw = '';
+      localStorage.removeItem('xs_pw');
+      throw new Error('Falsches Passwort');
+    }
+    return r;
+  });
+}
+
 // ── Splash ─────────────────────────────────────────────────────────
 window.addEventListener('load', () => {
   checkCookies();
@@ -430,7 +471,7 @@ async function go() {
 async function loadMedia(url) {
   setStat('Lade Medien…','loading');
   try {
-    const r = await fetch(S+'/info',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
+    const r = await apiFetch('/info',{method:'POST',body:JSON.stringify({url})});
     const d = await r.json();
     if (!r.ok) throw new Error(d.error);
     hideStat();
@@ -451,7 +492,7 @@ function renderMedia(d, tweetUrl) {
     d.formats.forEach((f,i) => {
       const sz = f.filesize ? ' · '+(f.filesize/1024/1024).toFixed(1)+' MB':'';
       const a = document.createElement('a');
-      a.href = S+'/download?url='+encodeURIComponent(tweetUrl)+'&q='+encodeURIComponent(f.quality);
+      a.href = S+'/download?url='+encodeURIComponent(tweetUrl)+'&q='+encodeURIComponent(f.quality)+'&pw='+encodeURIComponent(_pw);
       a.className = 'dl'+(i===0?' p':'');
       a.innerHTML = '<div class="dl-l"><div class="dl-i">↓</div><div><div class="dl-t">'+f.quality+'</div><div class="dl-s">MP4'+sz+'</div></div></div><span class="dl-a">›</span>';
       c.appendChild(a);
@@ -475,7 +516,7 @@ function renderMedia(d, tweetUrl) {
 async function loadPlaylist(url) {
   setStat('Lade… (kann 15–30 Sek. dauern)','loading');
   try {
-    const r = await fetch(S+'/playlist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
+    const r = await apiFetch('/playlist',{method:'POST',body:JSON.stringify({url})});
     const d = await r.json();
     if (!r.ok) throw new Error(d.error);
     hideStat();
@@ -525,7 +566,7 @@ function renderPlaylist(d) {
 // ── Cookies ────────────────────────────────────────────────────────
 async function checkCookies() {
   try {
-    const r = await fetch(S+'/cookies/status');
+    const r = await apiFetch('/cookies/status');
     const d = await r.json();
     document.getElementById('cdot').classList.toggle('on', d.active);
     document.getElementById('delBtn').style.display = d.active ? 'flex':'none';
@@ -548,14 +589,14 @@ async function saveCookies() {
   const txt = document.getElementById('cookieTxt').value.trim();
   if (!txt) return;
   try {
-    const r = await fetch(S+'/cookies',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cookies:txt})});
+    const r = await apiFetch('/cookies',{method:'POST',body:JSON.stringify({cookies:txt})});
     const d = await r.json();
     if (d.ok) { closeModal(); checkCookies(); document.getElementById('cookieTxt').value=''; }
   } catch(e) { alert('Fehler: '+e.message); }
 }
 
 async function deleteCookies() {
-  await fetch(S+'/cookies',{method:'DELETE'});
+  await apiFetch('/cookies',{method:'DELETE'});
   closeModal(); checkCookies();
 }
 
