@@ -1,5 +1,5 @@
 const express = require('express');
-const { exec, spawn } = require('child_process');
+const { spawn } = require('child_process');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
@@ -7,6 +7,7 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const COOKIES_PATH = '/tmp/cookies.txt';
+const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
@@ -32,19 +33,34 @@ app.use((req, res, next) => {
   res.status(401).json({ error: 'Nicht autorisiert' });
 });
 
-// ── Cookie helpers ────────────────────────────────────────────────
-function getCookieArgs() {
-  if (fs.existsSync(COOKIES_PATH)) return `--cookies "${COOKIES_PATH}"`;
-  return '';
-}
-
-function ytdlp(args) {
+// ── yt-dlp helper (gefixt mit spawn) ──────────────────────────────
+function ytdlp(argsArray) {
   return new Promise((resolve, reject) => {
-    const cookies = getCookieArgs();
-    exec(`yt-dlp ${cookies} ${args}`, { timeout: 60000, maxBuffer: 20 * 1024 * 1024 }, (err, stdout, stderr) => {
-      if (err) reject(new Error(stderr || err.message));
-      else resolve(stdout.trim());
+    const params = [];
+    if (fs.existsSync(COOKIES_PATH)) {
+      params.push('--cookies', COOKIES_PATH);
+    }
+    params.push('--user-agent', DEFAULT_USER_AGENT);
+    params.push(...argsArray);
+
+    const proc = spawn('yt-dlp', params);
+    let stdout = '';
+    let stderr = '';
+
+    proc.stdout.on('data', d => stdout += d.toString());
+    proc.stderr.on('data', d => stderr += d.toString());
+
+    proc.on('close', code => {
+      if (code !== 0) {
+        console.error('yt-dlp error:', stderr);
+        // Gib die ersten 150 Zeichen des Fehlers zurück, damit das Frontend nicht platzt
+        reject(new Error(stderr.substring(0, 150) || 'Unbekannter yt-dlp Fehler'));
+      } else {
+        resolve(stdout.trim());
+      }
     });
+
+    proc.on('error', err => reject(err));
   });
 }
 
@@ -91,7 +107,7 @@ app.post('/info', async (req, res) => {
   if (!url || !/x\.com|twitter\.com/i.test(url))
     return res.status(400).json({ error: 'Ungültige URL' });
   try {
-    const raw = await ytdlp(`--dump-json --no-playlist "${url}"`);
+    const raw = await ytdlp(['--dump-json', '--no-playlist', url]);
     const info = JSON.parse(raw.split('\n')[0]);
 
     const formats = (info.formats || [])
@@ -115,7 +131,7 @@ app.post('/info', async (req, res) => {
       duration: info.duration || null,
     });
   } catch(e) {
-    res.status(500).json({ error: 'Nicht gefunden. Cookie eingeloggt?' });
+    res.status(500).json({ error: e.message || 'Nicht gefunden. Cookie eingeloggt?' });
   }
 });
 
@@ -125,7 +141,7 @@ app.post('/playlist', async (req, res) => {
   if (!url || !/x\.com|twitter\.com/i.test(url))
     return res.status(400).json({ error: 'Ungültige URL' });
   try {
-    const raw = await ytdlp(`--dump-json --flat-playlist --playlist-end 60 --no-warnings "${url}"`);
+    const raw = await ytdlp(['--dump-json', '--flat-playlist', '--playlist-end', '60', '--no-warnings', url]);
     const lines = raw.split('\n').filter(l => l.startsWith('{'));
     const items = lines.map(l => {
       try {
@@ -136,7 +152,7 @@ app.post('/playlist', async (req, res) => {
     const uploader = items.length && lines[0] ? (() => { try { return JSON.parse(lines[0]).uploader || ''; } catch { return ''; } })() : '';
     res.json({ items, uploader });
   } catch(e) {
-    res.status(500).json({ error: 'Nicht gefunden. Cookies nötig für Likes/Bookmarks.' });
+    res.status(500).json({ error: e.message || 'Nicht gefunden. Cookies nötig für Likes/Bookmarks.' });
   }
 });
 
@@ -149,11 +165,14 @@ app.get('/download', (req, res) => {
   res.setHeader('Content-Disposition', 'attachment; filename="xload.mp4"');
   res.setHeader('Content-Type', 'video/mp4');
 
-  const cookieArgs = fs.existsSync(COOKIES_PATH) ? ['--cookies', COOKIES_PATH] : [];
-  const args = [...cookieArgs, '-f', 'best[ext=mp4]/best', '--no-playlist', '-o', '-', url];
+  const args = [];
+  if (fs.existsSync(COOKIES_PATH)) args.push('--cookies', COOKIES_PATH);
+  args.push('--user-agent', DEFAULT_USER_AGENT);
+  args.push('-f', 'best[ext=mp4]/best', '--no-playlist', '-o', '-', url);
+  
   const proc = spawn('yt-dlp', args);
   proc.stdout.pipe(res);
-  proc.stderr.on('data', d => console.error('yt-dlp:', d.toString().slice(0,200)));
+  proc.stderr.on('data', d => console.error('yt-dlp dl error:', d.toString().slice(0,200)));
   proc.on('error', () => { if (!res.headersSent) res.status(500).send('Fehler'); });
   req.on('close', () => proc.kill());
 });
@@ -242,7 +261,7 @@ body{background:var(--bg);color:var(--text);font-family:'Geist',-apple-system,sa
 .paste-btn:active{background:#222;color:#fff}
 
 /* STATUS */
-.stat{display:none;align-items:center;gap:8px;background:var(--card);border:1px solid var(--border);border-radius:100px;padding:9px 14px;font-size:13px;font-weight:500;color:var(--sub)}
+.stat{display:none;align-items:center;gap:8px;background:var(--card);border:1px solid var(--border);border-radius:100px;padding:9px 14px;font-size:13px;font-weight:500;color:var(--sub);line-height:1.3}
 .stat.on{display:flex}
 .stat.ok{color:var(--green);border-color:rgba(0,232,122,.2);background:rgba(0,232,122,.05)}
 .stat.err{color:var(--red);border-color:rgba(255,59,59,.2);background:rgba(255,59,59,.05)}
@@ -315,14 +334,12 @@ body{background:var(--bg);color:var(--text);font-family:'Geist',-apple-system,sa
 </head>
 <body>
 
-<!-- SPLASH -->
 <div id="splash">
   <div class="sp-dev">matty dev</div>
   <div class="sp-logo"><b>X</b>Load</div>
   <div class="sp-bar"><div class="sp-fill"></div></div>
 </div>
 
-<!-- APP -->
 <div id="app">
   <div class="tb">
     <div class="tb-brand">
@@ -360,7 +377,7 @@ body{background:var(--bg);color:var(--text);font-family:'Geist',-apple-system,sa
     </div>
 
     <div class="stat" id="stat">
-      <div class="spin" id="spin"></div>
+      <div class="spin" id="spin" style="display:none"></div>
       <span id="statTxt"></span>
     </div>
 
@@ -378,7 +395,6 @@ body{background:var(--bg);color:var(--text);font-family:'Geist',-apple-system,sa
   </div>
 </div>
 
-<!-- COOKIE MODAL -->
 <div class="modal-bg" id="modalBg" onclick="e=>e.target===this&&closeModal()">
   <div class="modal">
     <h2>🔑 Cookie-Login</h2>
@@ -457,7 +473,6 @@ function sw(t) {
   document.getElementById('urlInp').placeholder = tabPlaceholders[t] || 'x.com/…';
   document.getElementById('urlInp').value = '';
 
-  // Auto-fill for likes/bookmarks
   if (t === 'bookmarks') document.getElementById('urlInp').value = 'https://x.com/i/bookmarks';
 }
 
@@ -554,7 +569,6 @@ function renderPlaylist(d) {
     document.getElementById('res').classList.add('on');
     return;
   }
-  // Lazy observer
   if (_obs) _obs.disconnect();
   _obs = new IntersectionObserver(entries => {
     entries.forEach(e => {
