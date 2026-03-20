@@ -9,6 +9,21 @@ const COOKIES_PATH = '/tmp/cookies.txt';
 const APP_PASSWORD = process.env.APP_PASSWORD || 'xload';
 const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 
+// ── Auto-load cookies from Railway env var ────────────────────────
+(function() {
+  const envCookies = process.env.TWITTER_COOKIES;
+  if (envCookies) {
+    try {
+      fs.writeFileSync(COOKIES_PATH, envCookies, 'utf8');
+      console.log('[COOKIES] Loaded from TWITTER_COOKIES env var');
+    } catch(e) {
+      console.error('[COOKIES] Failed to write env cookies:', e.message);
+    }
+  } else {
+    console.log('[COOKIES] No TWITTER_COOKIES env var found');
+  }
+})();
+
 app.use(cors());
 app.use(express.json({ limit: '5mb' }));
 
