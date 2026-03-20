@@ -681,11 +681,16 @@ let _obs = null;
 let _currentUrl = null;
 
 window.addEventListener('load', () => {
-  initStatus();
-  setTimeout(() => {
+  // Show app after splash — wrapped in try/catch so errors don't block it
+  const showApp = () => {
     document.getElementById('splash').classList.add('out');
     document.getElementById('app').classList.add('on');
-  }, 2700);
+  };
+  setTimeout(showApp, 2200);
+  // Fallback: force show after 4s no matter what
+  setTimeout(showApp, 4000);
+  
+  try { initStatus(); } catch(e) { console.error('initStatus:', e); }
 });
 
 (function(){
