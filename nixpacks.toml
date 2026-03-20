@@ -1,5 +1,11 @@
 [phases.setup]
-nixPkgs = ["nodejs_20", "yt-dlp", "ffmpeg"]
+nixPkgs = ["nodejs_20", "yt-dlp", "ffmpeg", "python3"]
+
+[phases.build]
+cmds = [
+  "npm install",
+  "pip install -U yt-dlp"
+]
 
 [start]
-cmd = "node server.js"
+cmd = "pip install -U yt-dlp --quiet && node server.js"
