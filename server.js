@@ -2,245 +2,210 @@ const express = require('express');
 const { spawn } = require('child_process');
 const cors = require('cors');
 const fs = require('fs');
+const path = require('path');
+
+/**
+ * XLoad Server v2.1 - Enhanced for NSFW & Stability
+ * ------------------------------------------------
+ * Dieser Server nutzt yt-dlp mit optimierten Headern und Cookie-Handling.
+ */
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const COOKIES_PATH = '/tmp/cookies.txt';
 const APP_PASSWORD = process.env.APP_PASSWORD || 'xload';
-const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 
-// ── Auto-load cookies from Railway env var ────────────────────────
-(function() {
-  const envCookies = process.env.TWITTER_COOKIES;
-  if (envCookies) {
-    try {
-      fs.writeFileSync(COOKIES_PATH, envCookies, 'utf8');
-      console.log('[COOKIES] Loaded from TWITTER_COOKIES env var');
-    } catch(e) {
-      console.error('[COOKIES] Failed to write env cookies:', e.message);
-    }
-  } else {
-    console.log('[COOKIES] No TWITTER_COOKIES env var found');
-  }
-})();
+// Standard User-Agent, der einen echten Browser imitiert
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 app.use(cors());
 app.use(express.json({ limit: '5mb' }));
 
-// ── AUTH ──────────────────────────────────────────────────────────
+// ── AUTH MIDDLEWARE ────────────────────────────────────────────────
 app.use((req, res, next) => {
   if (req.path === '/health' || (req.method === 'GET' && req.path === '/')) return next();
+  
+  // WICHTIG: Prüft Header (App) oder Query-String (Browser-Download)
   const auth = req.headers['x-password'] || req.query.pw;
-  if (auth === APP_PASSWORD) return next();
+  
+  // Session Cookie Support
+  const sessionCookie = req.headers.cookie?.split(';').find(c => c.trim().startsWith('xs_session='));
+  const sessionVal = sessionCookie ? sessionCookie.split('=')[1]?.trim() : null;
+
+  if (auth === APP_PASSWORD || sessionVal === APP_PASSWORD) return next();
+  
+  console.log(`[AUTH] Abgelehnt: ${req.method} ${req.path}`);
   res.status(401).json({ error: 'Nicht autorisiert' });
 });
 
-// ── YT-DLP ────────────────────────────────────────────────────────
-function runYtDlp(args) {
+// ── YT-DLP WRAPPER (SPAWN STATT EXEC FÜR NSFW) ─────────────────────
+/**
+ * Nutzt spawn für bessere Performance bei großen JSON-Daten und Streams.
+ * Fügt automatisch Cookies und User-Agent hinzu.
+ */
+function runYtDlp(argsArray) {
   return new Promise((resolve, reject) => {
-    const base = ['--user-agent', UA, '--no-warnings', '--no-check-certificate'];
-    if (fs.existsSync(COOKIES_PATH)) base.push('--cookies', COOKIES_PATH);
-    const all = [...base, ...args];
-    const proc = spawn('yt-dlp', all);
-    let out = '', err = '';
-    proc.stdout.on('data', d => out += d);
-    proc.stderr.on('data', d => err += d);
-    proc.on('close', code => {
+    const params = [
+      '--user-agent', UA,
+      '--no-check-certificate',
+      '--no-warnings'
+    ];
+
+    if (fs.existsSync(COOKIES_PATH)) {
+      params.push('--cookies', COOKIES_PATH);
+    }
+
+    params.push(...argsArray);
+
+    console.log(`[YT-DLP] Start: ${params.join(' ')}`);
+
+    const proc = spawn('yt-dlp', params);
+    let stdout = '';
+    let stderr = '';
+
+    proc.stdout.on('data', (data) => stdout += data.toString());
+    proc.stderr.on('data', (data) => stderr += data.toString());
+
+    proc.on('close', (code) => {
       if (code !== 0) {
-        const msg = err.includes('login') || err.includes('age') || err.includes('Inappropriate')
-          ? 'NSFW Block — Cookies aktualisieren! 🔑'
-          : err.split('\n').find(l => l.includes('ERROR')) || 'yt-dlp Fehler';
-        reject(new Error(msg));
-      } else resolve(out.trim());
+        console.error(`[YT-DLP] Error (Code ${code}):`, stderr);
+        // Spezielle Fehlermeldung für NSFW/Login Probleme
+        if (stderr.includes('Inappropriate') || stderr.includes('login')) {
+          reject(new Error('NSFW Block: Bitte Cookies im 🔑 Menü aktualisieren!'));
+        } else {
+          reject(new Error(stderr.split('\n')[0] || 'Unbekannter Fehler'));
+        }
+      } else {
+        resolve(stdout.trim());
+      }
     });
   });
 }
 
-// ── COOKIES ───────────────────────────────────────────────────────
+// ── API ROUTES ─────────────────────────────────────────────────────
+
 app.post('/cookies', (req, res) => {
   const { cookies } = req.body;
-  if (!cookies) return res.status(400).json({ error: 'Keine Cookies' });
-  fs.writeFileSync(COOKIES_PATH, cookies);
-  res.json({ ok: true });
+  if (!cookies) return res.status(400).json({ error: 'Keine Cookies geliefert' });
+  try {
+    fs.writeFileSync(COOKIES_PATH, cookies, 'utf8');
+    console.log('[COOKIES] Neue Cookies gespeichert');
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Fehler beim Speichern der Cookies' });
+  }
 });
-app.get('/cookies/status', (_, res) => res.json({ active: fs.existsSync(COOKIES_PATH) }));
+
+app.get('/cookies/status', (_, res) => {
+  res.json({ active: fs.existsSync(COOKIES_PATH) });
+});
+
 app.get('/cookies/check', (_, res) => {
-  if (!fs.existsSync(COOKIES_PATH)) return res.json({ ok: false, msg: 'Keine Cookies gespeichert' });
-  const c = fs.readFileSync(COOKIES_PATH, 'utf8');
-  const hasAuth = c.includes('auth_token');
-  const hasCt0 = c.includes('ct0');
-  res.json({ ok: hasAuth && hasCt0, msg: hasAuth && hasCt0 ? '✓ auth_token + ct0 gefunden' : '✗ auth_token oder ct0 fehlt!' });
+  if (!fs.existsSync(COOKIES_PATH)) return res.json({ ok: false, msg: 'Keine Cookies' });
+  const content = fs.readFileSync(COOKIES_PATH, 'utf8');
+  const hasAuth = content.includes('auth_token');
+  const hasCt0 = content.includes('ct0');
+  res.json({
+    ok: hasAuth,
+    msg: hasAuth ? 'Cookies OK (auth_token gefunden)' : 'auth_token fehlt in Cookies!'
+  });
 });
+
 app.delete('/cookies', (_, res) => {
   if (fs.existsSync(COOKIES_PATH)) fs.unlinkSync(COOKIES_PATH);
   res.json({ ok: true });
 });
 
-// ── INFO ──────────────────────────────────────────────────────────
+// INFO ROUTE
 app.post('/info', async (req, res) => {
   const { url } = req.body;
   if (!url) return res.status(400).json({ error: 'URL fehlt' });
 
   try {
-    // Try with --extractor-args to force twitter extractor + no age gate
-    const raw = await runYtDlp([
-      '--dump-json',
-      '--no-playlist',
-      '--extractor-args', 'twitter:api=graphql',
-      url
-    ]);
+    const raw = await runYtDlp(['--dump-json', '--no-playlist', url]);
+    const info = JSON.parse(raw.split('\n')[0]);
 
-    const info = JSON.parse(raw.split('\n').find(l => l.startsWith('{')));
-    const allFormats = info.formats || [];
-
-    // Get combined video+audio formats
-    let videoFormats = allFormats
-      .filter(f => f.vcodec && f.vcodec !== 'none' && f.acodec && f.acodec !== 'none' && f.url)
-      .map(f => ({ quality: f.height ? f.height + 'p' : 'SD', height: f.height || 0, ext: f.ext || 'mp4', url: f.url, filesize: f.filesize }))
+    // Formate filtern (Video + Audio kombiniert)
+    const formats = (info.formats || [])
+      .filter(f => f.vcodec !== 'none' && f.acodec !== 'none' && f.url)
+      .map(f => ({
+        quality: f.height ? f.height + 'p' : 'SD',
+        height: f.height || 0,
+        ext: f.ext || 'mp4'
+      }))
       .sort((a, b) => b.height - a.height);
 
-    // If no combined, take best video-only (rare fallback)
-    if (!videoFormats.length) {
-      videoFormats = allFormats
-        .filter(f => f.vcodec && f.vcodec !== 'none' && f.url)
-        .map(f => ({ quality: f.height ? f.height + 'p' : 'SD', height: f.height || 0, ext: f.ext || 'mp4', url: f.url, filesize: f.filesize }))
-        .sort((a, b) => b.height - a.height);
-    }
-
-    // Deduplicate
+    // Doppelte Qualitäten entfernen
     const seen = new Set();
-    const unique = videoFormats.filter(f => { if (seen.has(f.quality)) return false; seen.add(f.quality); return true; });
-
-    // Photos from extended_entities style thumbnails
-    const photos = (info.thumbnails || [])
-      .filter(t => t.url && (t.url.includes('/media/') || t.url.includes('twimg.com/media')))
-      .map(t => ({ url: t.url.split('?')[0] + '?name=orig', thumb: t.url }));
-
-    // Preview URL = lowest quality for 5-sec preview
-    const previewUrl = unique.length
-      ? unique[unique.length - 1].url  // lowest quality
-      : null;
+    const uniqueFormats = formats.filter(f => {
+      if (seen.has(f.quality)) return false;
+      seen.add(f.quality);
+      return true;
+    });
 
     res.json({
-      type: unique.length ? 'video' : photos.length ? 'photo' : 'unknown',
+      type: uniqueFormats.length ? 'video' : 'photo',
       uploader: info.uploader || info.uploader_id || 'X User',
       thumbnail: info.thumbnail || null,
-      formats: unique,
-      photos,
-      previewUrl,
-      duration: info.duration || null,
+      formats: uniqueFormats,
+      photos: (info.thumbnails || [])
+        .filter(t => t.url.includes('media'))
+        .map(t => ({ url: t.url.split('?')[0] + '?name=orig', thumb: t.url }))
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// ── PLAYLIST ─────────────────────────────────────────────────────
-app.post('/playlist', async (req, res) => {
-  const { url } = req.body;
-  if (!url) return res.status(400).json({ error: 'URL fehlt' });
-  try {
-    const raw = await runYtDlp(['--dump-json', '--flat-playlist', '--playlist-end', '50', '--no-warnings', url]);
-    const items = raw.split('\n').filter(l => l.startsWith('{')).map(l => {
-      try {
-        const d = JSON.parse(l);
-        return { id: d.id, url: d.url || d.webpage_url, thumbnail: d.thumbnail, type: d.duration ? 'video' : 'photo', title: d.title || '' };
-      } catch { return null; }
-    }).filter(Boolean);
-    res.json({ items, uploader: items[0]?.uploader || '' });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
-});
+// DOWNLOAD ROUTE (STREAMING)
+app.get('/download', (req, res) => {
+  const { url, q, pw } = req.query;
+  if (pw !== APP_PASSWORD) return res.status(401).send('Nicht autorisiert');
 
-// ── PREVIEW — first 5 seconds, low quality ───────────────────────
-app.get('/preview', (req, res) => {
-  const { url } = req.query;
-  if (!url) return res.status(400).send('Keine URL');
-
+  console.log(`[DOWNLOAD] Start: ${url} (${q || 'best'})`);
+  res.setHeader('Content-Disposition', 'attachment; filename="xload_video.mp4"');
   res.setHeader('Content-Type', 'video/mp4');
-  res.setHeader('Cache-Control', 'no-cache');
 
-  // Download lowest quality, pipe first ~5MB then kill
-  const base = ['--user-agent', UA, '--no-warnings', '--no-check-certificate'];
-  if (fs.existsSync(COOKIES_PATH)) base.push('--cookies', COOKIES_PATH);
-
-  const args = [...base,
-    '-f', 'worst[ext=mp4]/worst',
+  const args = [
+    '--user-agent', UA,
+    '-f', q ? `bestvideo[height<=${parseInt(q)}][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best` : 'best[ext=mp4]/best',
     '--no-playlist',
     '-o', '-',
     url
   ];
 
-  const proc = spawn('yt-dlp', args);
-  let bytes = 0;
-  const MAX = 3 * 1024 * 1024; // 3MB max for preview
+  if (fs.existsSync(COOKIES_PATH)) {
+    args.push('--cookies', COOKIES_PATH);
+  }
 
-  proc.stdout.on('data', chunk => {
-    bytes += chunk.length;
-    if (bytes > MAX) {
-      proc.kill();
-      res.end();
-      return;
-    }
-    res.write(chunk);
-  });
-
-  proc.on('close', () => { if (!res.writableEnded) res.end(); });
-  proc.stderr.on('data', d => console.error('[PREVIEW]', d.toString().slice(0, 100)));
-  req.on('close', () => proc.kill());
-});
-
-// ── DOWNLOAD ─────────────────────────────────────────────────────
-app.get('/download', (req, res) => {
-  const { url, q } = req.query;
-  if (!url) return res.status(400).send('Keine URL');
-
-  res.setHeader('Content-Disposition', 'attachment; filename="xload.mp4"');
-  res.setHeader('Content-Type', 'video/mp4');
-
-  const base = ['--user-agent', UA, '--no-warnings', '--no-check-certificate'];
-  if (fs.existsSync(COOKIES_PATH)) base.push('--cookies', COOKIES_PATH);
-
-  const fmt = q
-    ? `bestvideo[height<=${parseInt(q)}][ext=mp4]+bestaudio[ext=m4a]/best[height<=${parseInt(q)}][ext=mp4]/best[ext=mp4]/best`
-    : 'best[ext=mp4]/best';
-
-  const args = [...base, '-f', fmt, '--extractor-args', 'twitter:api=graphql', '--no-playlist', '-o', '-', url];
   const proc = spawn('yt-dlp', args);
   proc.stdout.pipe(res);
-  proc.stderr.on('data', d => console.error('[DL]', d.toString().slice(0, 150)));
-  req.on('close', () => proc.kill());
-});
 
-app.get('/health', (_, res) => res.json({ ok: true, cookies: fs.existsSync(COOKIES_PATH) }));
+  proc.stderr.on('data', (d) => {
+    if (d.toString().includes('ERROR')) console.error('[STREAM ERR]', d.toString());
+  });
 
-// ── DEBUG — test yt-dlp with a tweet ─────────────────────────────
-app.get('/debug', async (req, res) => {
-  const url = req.query.url || 'https://x.com/elonmusk/status/1';
-  const base = ['--user-agent', UA, '--no-warnings', '--no-check-certificate'];
-  if (fs.existsSync(COOKIES_PATH)) base.push('--cookies', COOKIES_PATH);
-  
-  const { spawn } = require('child_process');
-  const args = [...base, '--dump-json', '--no-playlist', '--extractor-args', 'twitter:api=graphql', url];
-  
-  const proc = spawn('yt-dlp', args);
-  let out = '', err = '';
-  proc.stdout.on('data', d => out += d);
-  proc.stderr.on('data', d => err += d);
-  proc.on('close', code => {
-    res.json({
-      code,
-      error: err.slice(0, 500),
-      hasOutput: out.length > 0,
-      ytdlpArgs: args.filter(a => !a.includes('cookies')).join(' ')
-    });
+  req.on('close', () => {
+    console.log('[DOWNLOAD] Verbindung vom User geschlossen');
+    proc.kill();
   });
 });
-app.get('/', (req, res) => { res.setHeader('Content-Type', 'text/html; charset=utf-8'); res.send(HTML); });
-app.listen(PORT, () => console.log(`XLoad v3 running on :${PORT} | cookies: ${fs.existsSync(COOKIES_PATH)}`));
 
-// ── HTML ──────────────────────────────────────────────────────────
+app.get('/health', (_, res) => res.json({ ok: true, version: '2.1' }));
+
+app.get('/', (req, res) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(HTML);
+});
+
+app.listen(PORT, () => console.log(`
+🚀 XLoad Server Online
+📍 Port: ${PORT}
+🔑 Passwort: ${APP_PASSWORD}
+🍪 Cookies: ${fs.existsSync(COOKIES_PATH) ? 'Aktiv' : 'Fehlen'}
+`));
+
+// ── UI / HTML ──────────────────────────────────────────────────────
 const HTML = `<!DOCTYPE html>
 <html lang="de">
 <head>
@@ -248,481 +213,166 @@ const HTML = `<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="XLoad">
 <meta name="theme-color" content="#000">
 <title>XLoad</title>
-<link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%23000'/><path d='M57 46L71 27H66L55 43 45 27H30L45 51 30 73H35L47 56 58 73H73Z' fill='white'/></svg>">
-<link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;600;700;800&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;600;800&display=swap" rel="stylesheet">
 <style>
-*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
-:root{--bg:#000;--card:#111;--card2:#181818;--border:#1e1e1e;--text:#fff;--sub:#555;--green:#00e87a;--red:#ff3b3b}
-html,body{background:var(--bg);color:var(--text);font-family:'Geist',-apple-system,sans-serif;height:100dvh;overflow:hidden;-webkit-font-smoothing:antialiased}
+:root { --bg:#000; --card:#111; --border:#222; --text:#fff; --accent:#fff; --sub:#555; --green:#00e87a; --red:#ff3b3b; }
+* { box-sizing:border-box; margin:0; padding:0; -webkit-tap-highlight-color:transparent; }
+body { background:var(--bg); color:var(--text); font-family:'Geist',sans-serif; height:100dvh; display:flex; flex-direction:column; overflow:hidden; }
 
-/* SPLASH */
-#splash{position:fixed;inset:0;background:#000;z-index:999;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;transition:opacity .6s,transform .6s}
-#splash.out{opacity:0;transform:scale(1.04);pointer-events:none}
-.sp-dev{font-size:10px;font-weight:600;color:#222;letter-spacing:3px;text-transform:uppercase;opacity:0;animation:fi .5s .3s forwards}
-.sp-name{font-size:54px;font-weight:800;letter-spacing:-4px;opacity:0;animation:su .7s .6s cubic-bezier(.34,1.56,.64,1) forwards;line-height:1}
-.sp-bar{width:40px;height:2px;background:#111;border-radius:2px;margin-top:4px;overflow:hidden;opacity:0;animation:fi .3s 1s forwards}
-.sp-fill{height:100%;background:#fff;animation:pr 1.3s 1.1s cubic-bezier(.4,0,.2,1) forwards;width:0}
-@keyframes fi{to{opacity:1}}
-@keyframes su{from{opacity:0;transform:translateY(18px)}to{opacity:1;transform:none}}
-@keyframes pr{to{width:100%}}
+/* Splash */
+#splash { position:fixed; inset:0; background:#000; z-index:999; display:flex; flex-direction:column; align-items:center; justify-content:center; transition:opacity .5s; }
+#splash.hide { opacity:0; pointer-events:none; }
+.logo { font-size:42px; font-weight:800; letter-spacing:-2px; }
 
-/* APP */
-#app{height:100dvh;display:flex;flex-direction:column;opacity:0;transition:opacity .4s}
-#app.on{opacity:1}
+/* Layout */
+#app { flex:1; display:flex; flex-direction:column; padding:20px; max-width:500px; margin:0 auto; width:100%; opacity:0; transition:opacity .5s; }
+#app.on { opacity:1; }
+.header { display:flex; justify-content:space-between; align-items:center; margin-bottom:30px; padding-top:env(safe-area-inset-top); }
+.dot { width:10px; height:10px; border-radius:50%; background:var(--border); transition:0.3s; }
+.dot.on { background:var(--green); box-shadow:0 0 10px var(--green); }
 
-/* TOPBAR */
-.tb{padding:calc(env(safe-area-inset-top,44px) + 10px) 16px 8px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
-.tb-brand .dev{font-size:10px;font-weight:600;color:#222;letter-spacing:2px;text-transform:uppercase}
-.tb-brand .name{font-size:22px;font-weight:800;letter-spacing:-1px;line-height:1.1}
-.tb-right{display:flex;align-items:center;gap:10px}
-.cdot{width:8px;height:8px;border-radius:50%;background:#222;transition:.3s;flex-shrink:0}
-.cdot.on{background:var(--green);box-shadow:0 0 8px var(--green)}
-.ibtn{width:36px;height:36px;background:var(--card);border:1px solid var(--border);border-radius:50%;display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:16px}
-.ibtn:active{background:var(--card2)}
+/* Input */
+.card { background:var(--card); border:1px solid var(--border); border-radius:24px; padding:20px; margin-bottom:15px; }
+.url-input { width:100%; background:#1a1a1a; border:1px solid #333; border-radius:14px; color:#fff; padding:15px; font-size:16px; outline:none; margin-bottom:12px; font-family:inherit; }
+.btn-main { width:100%; background:#fff; color:#000; border:none; border-radius:14px; padding:15px; font-weight:700; font-size:16px; cursor:pointer; transition:transform 0.1s; }
+.btn-main:active { transform:scale(0.98); }
 
-/* TABS */
-.tabs{display:flex;gap:5px;padding:6px 16px 8px;overflow-x:auto;flex-shrink:0;scrollbar-width:none}
-.tabs::-webkit-scrollbar{display:none}
-.tab{flex:1;min-width:60px;padding:9px 6px 8px;border-radius:13px;background:var(--card);border:1px solid var(--border);font-family:inherit;font-size:11px;font-weight:600;color:var(--sub);cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:3px;transition:all .2s;white-space:nowrap}
-.tab .ti{font-size:18px}
-.tab.on{background:#fff;border-color:#fff;color:#000}
-.tab:active{transform:scale(.95)}
+/* Results */
+#res { display:none; flex-direction:column; gap:10px; overflow-y:auto; padding-bottom:40px; }
+#res.on { display:flex; }
+.thumb { width:100%; aspect-ratio:16/9; border-radius:16px; object-fit:cover; margin-bottom:10px; border:1px solid var(--border); }
+.dl-btn { display:flex; justify-content:space-between; align-items:center; background:var(--card); border:1px solid var(--border); border-radius:16px; padding:16px; text-decoration:none; color:#fff; }
+.dl-btn:active { background:#1a1a1a; }
+.dl-btn.pri { background:#fff; color:#000; border-color:#fff; }
+.dl-info { display:flex; flex-direction:column; }
+.dl-q { font-weight:700; font-size:16px; }
+.dl-ext { font-size:12px; opacity:0.6; }
 
-/* SCROLL */
-.scr{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:0 14px;display:flex;flex-direction:column;gap:10px;padding-bottom:calc(env(safe-area-inset-bottom,20px) + 16px)}
+/* Status */
+#stat { font-size:13px; color:var(--sub); text-align:center; margin-top:10px; min-height:1.5em; }
+.err { color:var(--red) !important; }
 
-/* INPUT */
-.icard{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:14px;display:flex;flex-direction:column;gap:9px}
-.irow{display:flex;gap:8px;align-items:center}
-.uinp{flex:1;min-width:0;background:var(--card2);border:1.5px solid var(--border);border-radius:12px;color:#fff;font-family:inherit;font-size:15px;padding:12px 13px;outline:none;-webkit-appearance:none;transition:border-color .15s}
-.uinp:focus{border-color:#333}
-.uinp::placeholder{color:#272727}
-.gbtn{width:46px;height:46px;background:#fff;color:#000;border:none;border-radius:12px;font-size:22px;font-weight:700;cursor:pointer;flex-shrink:0;display:flex;align-items:center;justify-content:center;transition:transform .1s,opacity .15s}
-.gbtn:active{transform:scale(.9)}
-.gbtn:disabled{opacity:.2}
-.pbtn{background:var(--card2);border:1px solid var(--border);border-radius:10px;color:var(--sub);font-family:inherit;font-size:14px;font-weight:500;padding:11px;cursor:pointer;transition:background .15s,color .15s}
-.pbtn:active{background:#222;color:#fff}
-
-/* STATUS */
-.stat{display:none;align-items:center;gap:8px;background:var(--card);border:1px solid var(--border);border-radius:100px;padding:9px 14px;font-size:13px;font-weight:500;color:var(--sub)}
-.stat.on{display:flex}
-.stat.ok{color:var(--green);border-color:rgba(0,232,122,.2);background:rgba(0,232,122,.05)}
-.stat.err{color:var(--red);border-color:rgba(255,59,59,.2);background:rgba(255,59,59,.05)}
-.spin{width:13px;height:13px;border:2px solid #222;border-top-color:#888;border-radius:50%;animation:rot .6s linear infinite;flex-shrink:0}
-@keyframes rot{to{transform:rotate(360deg)}}
-
-/* RESULT */
-.res{display:none;background:var(--card);border:1px solid var(--border);border-radius:18px;overflow:hidden;animation:pop .3s cubic-bezier(.34,1.56,.64,1)}
-.res.on{display:block}
-@keyframes pop{from{opacity:0;transform:translateY(8px) scale(.97)}to{opacity:1;transform:none}}
-
-/* PREVIEW PLAYER */
-.preview-wrap{position:relative;width:100%;aspect-ratio:16/9;background:#000;cursor:pointer;overflow:hidden}
-.preview-wrap video{width:100%;height:100%;object-fit:cover;display:block}
-.preview-wrap img{width:100%;height:100%;object-fit:cover;display:block}
-.preview-play{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.35);transition:opacity .2s}
-.preview-play span{font-size:48px;filter:drop-shadow(0 2px 8px rgba(0,0,0,.5))}
-.preview-play.hidden{opacity:0;pointer-events:none}
-.preview-badge{position:absolute;bottom:10px;left:10px;background:rgba(0,0,0,.6);backdrop-filter:blur(8px);border-radius:100px;padding:4px 10px;font-size:10px;font-weight:700;letter-spacing:.8px;text-transform:uppercase}
-.preview-loading{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.7);display:none}
-
-/* RESULT BODY */
-.rbody{padding:14px;display:flex;flex-direction:column;gap:8px}
-.rmeta{display:flex;align-items:center;gap:6px}
-.rdot{width:6px;height:6px;border-radius:50%;background:var(--green);flex-shrink:0}
-.rsub{font-size:12px;color:var(--sub);font-weight:500}
-
-/* DL BUTTONS */
-.dl{display:flex;align-items:center;justify-content:space-between;background:var(--card2);border:1px solid var(--border);border-radius:13px;padding:13px;text-decoration:none;color:inherit;transition:background .15s;gap:10px;margin-bottom:7px}
-.dl:last-child{margin-bottom:0}
-.dl:active{background:#222}
-.dl.p{background:#fff;border-color:#fff}
-.dl.p .dt{color:#000}.dl.p .ds{color:rgba(0,0,0,.45)}.dl.p .da{color:rgba(0,0,0,.3)}.dl.p .di{background:rgba(0,0,0,.07)}
-.dl-l{display:flex;align-items:center;gap:10px;flex:1;min-width:0}
-.di{width:34px;height:34px;background:rgba(255,255,255,.07);border-radius:9px;display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:14px}
-.dt{font-size:15px;font-weight:600}
-.ds{font-size:12px;color:var(--sub);margin-top:1px}
-.da{color:var(--sub);font-size:17px;flex-shrink:0}
-
-/* PHOTO GRID */
-.pgrid{display:grid;grid-template-columns:repeat(2,1fr);gap:6px}
-.pitem{aspect-ratio:1;border-radius:10px;overflow:hidden;background:var(--card2);position:relative;cursor:pointer;text-decoration:none;display:block;border:1px solid var(--border)}
-.pitem img{width:100%;height:100%;object-fit:cover;display:block}
-.pov{position:absolute;inset:0;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center;font-size:20px;opacity:0;transition:opacity .15s}
-.pitem:active .pov{opacity:1}
-
-/* MEDIA GRID */
-.mgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:2px}
-.mitem{aspect-ratio:1;background:var(--card2);position:relative;overflow:hidden;cursor:pointer}
-.mitem img{width:100%;height:100%;object-fit:cover;display:block;background:#111}
-.mov{position:absolute;inset:0;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center;font-size:16px;opacity:0;transition:opacity .15s}
-.mitem:active .mov{opacity:1}
-.mvbadge{position:absolute;bottom:3px;right:4px;background:rgba(0,0,0,.7);border-radius:3px;padding:1px 4px;font-size:9px;font-weight:700}
-
-/* COOKIE MODAL */
-.mbg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.88);z-index:100;align-items:flex-end;justify-content:center}
-.mbg.on{display:flex}
-.mc{background:#111;border:1px solid #222;border-radius:24px 24px 0 0;width:100%;max-width:480px;padding:20px 20px calc(env(safe-area-inset-bottom,20px) + 20px);animation:mup .3s cubic-bezier(.34,1.56,.64,1)}
-@keyframes mup{from{transform:translateY(100%)}to{transform:none}}
-.mc h2{font-size:17px;font-weight:700;margin-bottom:6px}
-.mc p{font-size:12px;color:var(--sub);line-height:1.5;margin-bottom:12px}
-.mc ol{font-size:12px;color:var(--sub);line-height:1.9;padding-left:16px;margin-bottom:14px}
-.mc ol b{color:#aaa}
-.mc textarea{width:100%;background:var(--card2);border:1.5px solid var(--border);border-radius:12px;color:#fff;font-family:monospace;font-size:11px;padding:11px;outline:none;resize:none;height:90px;margin-bottom:10px}
-.mrow{display:flex;gap:7px}
-.mb{flex:1;padding:13px;border-radius:12px;border:none;font-family:inherit;font-size:14px;font-weight:600;cursor:pointer;transition:opacity .15s}
-.mb:active{opacity:.8}
-.mb.pri{background:#fff;color:#000}
-.mb.sec{background:var(--card2);color:var(--sub);border:1px solid var(--border)}
-.mstatus{font-size:12px;padding:8px 12px;border-radius:8px;background:var(--card2);margin-bottom:10px;display:none}
-
-/* TIP */
-.tip{background:var(--card);border:1px solid var(--border);border-radius:13px;padding:12px 14px;display:flex;align-items:center;gap:10px}
-.tip.gone{display:none}
-.tip p{flex:1;font-size:12px;color:var(--sub);line-height:1.4}
-.tip p b{color:#777}
-.tipx{background:none;border:none;color:#2a2a2a;font-size:20px;cursor:pointer;padding:0;line-height:1;flex-shrink:0}
+/* Keys Modal */
+.modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.9); z-index:1000; padding:20px; align-items:center; justify-content:center; }
+.modal.on { display:flex; }
+.modal-content { background:var(--card); border:1px solid var(--border); border-radius:24px; padding:20px; width:100%; max-width:400px; }
+textarea { width:100%; height:150px; background:#000; color:var(--green); border:1px solid var(--border); border-radius:12px; padding:10px; font-size:10px; font-family:monospace; margin:10px 0; outline:none; }
 </style>
 </head>
 <body>
 
-<div id="splash">
-  <div class="sp-dev">matty dev</div>
-  <div class="sp-name">XLoad</div>
-  <div class="sp-bar"><div class="sp-fill"></div></div>
-</div>
+<div id="splash"><div class="logo">XLoad</div></div>
 
 <div id="app">
-  <div class="tb">
-    <div class="tb-brand">
-      <div class="dev">matty dev</div>
-      <div class="name">XLoad</div>
-    </div>
-    <div class="tb-right">
-      <div class="cdot" id="cdot"></div>
-      <div class="ibtn" onclick="openModal()">🔑</div>
+  <div class="header">
+    <div class="logo" style="font-size:24px">XLoad</div>
+    <div style="display:flex; align-items:center; gap:15px">
+      <div class="dot" id="cdot"></div>
+      <div onclick="openModal()" style="cursor:pointer; font-size:20px">🔑</div>
     </div>
   </div>
 
-  <div class="tabs">
-    <button class="tab on" id="t-video" onclick="sw('video')"><span class="ti">🎬</span>Video</button>
-    <button class="tab" id="t-photo" onclick="sw('photo')"><span class="ti">🖼️</span>Foto</button>
-    <button class="tab" id="t-profile" onclick="sw('profile')"><span class="ti">👤</span>Profil</button>
-    <button class="tab" id="t-likes" onclick="sw('likes')"><span class="ti">❤️</span>Likes</button>
-    <button class="tab" id="t-bookmarks" onclick="sw('bookmarks')"><span class="ti">🔖</span>Saves</button>
+  <div class="card">
+    <input type="url" id="urlInp" class="url-input" placeholder="X Link hier einfügen..." autocomplete="off">
+    <button class="btn-main" onclick="go()">Medien finden</button>
+    <div id="stat"></div>
   </div>
 
-  <div class="scr">
-
-    <div class="tip" id="tip">
-      <p>📲 <b>Teilen ↑</b> → <b>Zum Home-Bildschirm</b> für App-Icon</p>
-      <button class="tipx" onclick="closeTip()">×</button>
-    </div>
-
-    <div class="icard">
-      <div class="irow">
-        <input class="uinp" id="uinp" type="url" placeholder="x.com/… Link einfügen"
-          autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false">
-        <button class="gbtn" id="gbtn" onclick="go()">↓</button>
-      </div>
-      <button class="pbtn" onclick="doPaste()">📋&nbsp; Aus Zwischenablage</button>
-    </div>
-
-    <div class="stat" id="stat">
-      <div class="spin" id="spin"></div>
-      <span id="stxt"></span>
-    </div>
-
-    <div class="res" id="res">
-      <!-- Preview player -->
-      <div class="preview-wrap" id="pvWrap" style="display:none" onclick="togglePreview()">
-        <img id="pvThumb" src="" alt="">
-        <video id="pvVideo" preload="none" playsinline muted style="display:none;position:absolute;inset:0;width:100%;height:100%;object-fit:cover"></video>
-        <div class="preview-play" id="pvPlay"><span>▶</span></div>
-        <div class="preview-badge" id="pvBadge">Video</div>
-      </div>
-      <div class="rbody">
-        <div class="rmeta"><div class="rdot"></div><span class="rsub" id="rsub"></span></div>
-        <div id="rcontent"></div>
-      </div>
-    </div>
-
+  <div id="res">
+    <img id="rThumb" class="thumb">
+    <div id="rUploader" style="font-size:14px; color:var(--sub); margin-bottom:10px"></div>
+    <div id="rLinks" style="display:flex; flex-direction:column; gap:8px"></div>
   </div>
 </div>
 
-<!-- COOKIE MODAL -->
-<div class="mbg" id="mbg" onclick="if(event.target===this)closeModal()">
-  <div class="mc">
-    <h2>🔑 Cookie-Login</h2>
-    <p>Für NSFW, Likes und Bookmarks brauchst du deine Twitter-Cookies.</p>
-    <ol>
-      <li>Installiere <b>„Get cookies.txt LOCALLY"</b> im Browser</li>
-      <li>Geh auf <b>x.com</b> (eingeloggt)</li>
-      <li>Extension öffnen → <b>Copy</b> klicken</li>
-      <li>Hier einfügen</li>
-    </ol>
-    <div class="mstatus" id="mstatus"></div>
-    <textarea id="ctxt" placeholder="# Netscape HTTP Cookie File&#10;.twitter.com	TRUE	/	..."></textarea>
-    <div class="mrow">
-      <button class="mb sec" onclick="closeModal()">Abbrechen</button>
-      <button class="mb sec" id="delbtn" style="display:none" onclick="delCookies()">🗑 Reset</button>
-      <button class="mb sec" id="chkbtn" style="display:none" onclick="checkCookies()">🔍 Prüfen</button>
-      <button class="mb pri" onclick="saveCookies()">Speichern</button>
-    </div>
+<div class="modal" id="modal">
+  <div class="modal-content">
+    <h3>🔑 Cookies & Auth</h3>
+    <p style="font-size:12px; color:var(--sub); margin:10px 0">Füge hier deine Netscape-Cookies ein (für NSFW nötig).</p>
+    <textarea id="cookTxt" placeholder="# Netscape HTTP Cookie File..."></textarea>
+    <button class="btn-main" onclick="saveCookies()">Speichern</button>
+    <button class="btn-main" onclick="closeModal()" style="background:transparent; color:var(--sub); margin-top:8px">Schließen</button>
   </div>
 </div>
 
 <script>
+let _pw = localStorage.getItem('xl_pw') || '';
 const S = window.location.origin;
-let tab = 'video';
-let _pw = localStorage.getItem('xs_pw') || '';
-let _previewUrl = null;
-let _pvLoaded = false;
-let _obs = null;
 
-// ── Splash ─────────────────────────────────────────────────────────
-window.addEventListener('load', () => {
-  initCookieStatus();
-  setTimeout(() => {
-    document.getElementById('splash').classList.add('out');
+// Splash & Init
+window.onload = () => {
+  setTimeout(() => { 
+    document.getElementById('splash').classList.add('hide');
     document.getElementById('app').classList.add('on');
-  }, 2500);
-});
+  }, 1000);
+  checkStatus();
+};
 
-// ── iOS tip ────────────────────────────────────────────────────────
-(function(){
-  const ios=/iphone|ipad|ipod/i.test(navigator.userAgent);
-  if(!ios||navigator.standalone||localStorage.getItem('xs_tip')) document.getElementById('tip').classList.add('gone');
-})();
-function closeTip(){ localStorage.setItem('xs_tip','1'); document.getElementById('tip').classList.add('gone'); }
+async function checkStatus() {
+  const r = await fetch(S + '/cookies/status');
+  const d = await r.json();
+  document.getElementById('cdot').classList.toggle('on', d.active);
+}
 
-// ── Auth fetch ─────────────────────────────────────────────────────
-async function api(path, opts={}) {
-  if (!_pw) {
-    _pw = prompt('XLoad Passwort:') || '';
-    localStorage.setItem('xs_pw', _pw);
-  }
-  opts.headers = { ...(opts.headers||{}), 'Content-Type':'application/json', 'x-password':_pw };
+function openModal() { document.getElementById('modal').classList.add('on'); }
+function closeModal() { document.getElementById('modal').classList.remove('on'); }
+
+async function saveCookies() {
+  const val = document.getElementById('cookTxt').value.trim();
+  if(!val) return;
+  await api('/cookies', { method:'POST', body: JSON.stringify({cookies: val}) });
+  closeModal();
+  checkStatus();
+}
+
+async function api(path, opts = {}) {
+  if(!_pw) { _pw = prompt('Passwort eingeben:'); localStorage.setItem('xl_pw', _pw); }
+  opts.headers = { ...opts.headers, 'Content-Type': 'application/json', 'x-password': _pw };
   const r = await fetch(S + path, opts);
-  if (r.status === 401) { _pw=''; localStorage.removeItem('xs_pw'); throw new Error('Falsches Passwort'); }
+  if(r.status === 401) { localStorage.removeItem('xl_pw'); _pw = ''; location.reload(); }
   return r;
 }
 
-// ── Tabs ───────────────────────────────────────────────────────────
-const tabHints = { video:'x.com/… Video-Link', photo:'x.com/… Foto-Link', profile:'x.com/username/media', likes:'x.com/username/likes', bookmarks:'x.com/i/bookmarks' };
-function sw(t) {
-  tab=t;
-  document.querySelectorAll('.tab').forEach(e=>e.classList.remove('on'));
-  document.getElementById('t-'+t).classList.add('on');
-  reset();
-  document.getElementById('uinp').placeholder = tabHints[t]||'x.com/…';
-  document.getElementById('uinp').value = t==='bookmarks' ? 'https://x.com/i/bookmarks' : '';
-}
-
-// ── Paste ──────────────────────────────────────────────────────────
-async function doPaste() {
-  try {
-    const t=(await navigator.clipboard.readText()).trim();
-    if (!t) return;
-    document.getElementById('uinp').value=t;
-    if (/x\\.com|twitter\\.com/i.test(t)) go();
-  } catch { document.getElementById('uinp').focus(); }
-}
-document.getElementById('uinp').addEventListener('keydown',e=>{ if(e.key==='Enter') go(); });
-
-// ── Go ─────────────────────────────────────────────────────────────
 async function go() {
-  const url = document.getElementById('uinp').value.trim();
-  if (!url) return;
-  if (!/x\\.com|twitter\\.com/i.test(url)) { setStat('Kein gültiger X Link.','err'); return; }
-  reset();
-  document.getElementById('gbtn').disabled=true;
-  if (tab==='profile'||tab==='likes'||tab==='bookmarks') await loadPlaylist(url);
-  else await loadMedia(url);
-  document.getElementById('gbtn').disabled=false;
-}
+  const url = document.getElementById('urlInp').value.trim();
+  if(!url) return;
+  
+  const stat = document.getElementById('stat');
+  const resDiv = document.getElementById('res');
+  stat.textContent = 'Analysiere Link...';
+  stat.className = '';
+  resDiv.classList.remove('on');
 
-// ── Single media ───────────────────────────────────────────────────
-async function loadMedia(url) {
-  setStat('Lade Medien…','loading');
   try {
-    const r = await api('/info',{method:'POST',body:JSON.stringify({url})});
+    const r = await api('/info', { method:'POST', body: JSON.stringify({url}) });
     const d = await r.json();
-    if (!r.ok) throw new Error(d.error);
-    hideStat();
-    renderMedia(d, url);
-  } catch(e) { setStat('⚠ '+e.message,'err'); }
-}
+    if(!r.ok) throw new Error(d.error);
 
-function renderMedia(d, tweetUrl) {
-  _previewUrl = null; _pvLoaded = false;
+    stat.textContent = '';
+    document.getElementById('rThumb').src = d.thumbnail || '';
+    document.getElementById('rUploader').textContent = '@' + d.uploader;
+    
+    const links = document.getElementById('rLinks');
+    links.innerHTML = '';
 
-  if (d.thumbnail) {
-    document.getElementById('pvThumb').src = d.thumbnail;
-    document.getElementById('pvWrap').style.display = 'block';
-    document.getElementById('pvBadge').textContent = d.type==='video' ? 'Video · Tippen für Preview' : 'Foto';
-    if (d.type==='video' && d.previewUrl) {
-      _previewUrl = S+'/preview?url='+encodeURIComponent(tweetUrl)+'&pw='+encodeURIComponent(_pw);
+    if(d.formats && d.formats.length) {
+      d.formats.forEach((f, i) => {
+        const a = document.createElement('a');
+        a.className = 'dl-btn' + (i === 0 ? ' pri' : '');
+        // WICHTIG: pw wird hier für den Download-Link angehängt!
+        a.href = \`\${S}/download?url=\${encodeURIComponent(url)}&q=\${f.height}&pw=\${_pw}\`;
+        a.innerHTML = \`<div class="dl-info"><span class="dl-q">\${f.quality} Video</span><span class="dl-ext">MP4 / \${f.ext}</span></div><span>↓</span>\`;
+        links.appendChild(a);
+      });
     }
+
+    resDiv.classList.add('on');
+  } catch (e) {
+    stat.textContent = e.message;
+    stat.className = 'err';
   }
-
-  document.getElementById('rsub').textContent = d.uploader ? '@'+d.uploader : 'Medien gefunden';
-  const c = document.getElementById('rcontent');
-  c.innerHTML='';
-
-  if (d.formats && d.formats.length) {
-    d.formats.forEach((f,i) => {
-      const a = document.createElement('a');
-      a.href = S+'/download?url='+encodeURIComponent(tweetUrl)+'&q='+f.height+'&pw='+encodeURIComponent(_pw);
-      a.className='dl'+(i===0?' p':'');
-      a.innerHTML='<div class="dl-l"><div class="di">↓</div><div><div class="dt">'+f.quality+'</div><div class="ds">MP4</div></div></div><span class="da">›</span>';
-      c.appendChild(a);
-    });
-  } else if (d.photos && d.photos.length) {
-    const g=document.createElement('div'); g.className='pgrid';
-    d.photos.forEach((p,i)=>{
-      const a=document.createElement('a');
-      a.className='pitem'; a.href=p.url; a.download='xload_'+(i+1)+'.jpg'; a.target='_blank';
-      a.innerHTML='<img src="'+(p.thumb||p.url)+'" loading="lazy"><div class="pov">↓</div>';
-      g.appendChild(a);
-    });
-    c.appendChild(g);
-  } else {
-    c.innerHTML='<div style="text-align:center;color:#444;font-size:13px;padding:14px">Keine Medien. Cookies aktuell? 🔑</div>';
-  }
-  document.getElementById('res').classList.add('on');
-}
-
-// ── Preview toggle ─────────────────────────────────────────────────
-function togglePreview() {
-  if (!_previewUrl) return;
-  const vid = document.getElementById('pvVideo');
-  const thumb = document.getElementById('pvThumb');
-  const play = document.getElementById('pvPlay');
-
-  if (!_pvLoaded) {
-    _pvLoaded = true;
-    vid.src = _previewUrl;
-    vid.style.display='block';
-    thumb.style.display='none';
-    play.classList.add('hidden');
-    vid.play().catch(()=>{});
-    // Auto stop after 5 sec
-    setTimeout(()=>{
-      vid.pause();
-      play.classList.remove('hidden');
-    }, 5000);
-  } else if (vid.paused) {
-    vid.play();
-    play.classList.add('hidden');
-    setTimeout(()=>{ vid.pause(); play.classList.remove('hidden'); }, 5000);
-  } else {
-    vid.pause();
-    play.classList.remove('hidden');
-  }
-}
-
-// ── Playlist ───────────────────────────────────────────────────────
-async function loadPlaylist(url) {
-  setStat('Lade… (15–30 Sek.)','loading');
-  try {
-    const r = await api('/playlist',{method:'POST',body:JSON.stringify({url})});
-    const d = await r.json();
-    if (!r.ok) throw new Error(d.error);
-    hideStat();
-    renderPlaylist(d);
-  } catch(e) { setStat('⚠ '+e.message,'err'); }
-}
-
-function renderPlaylist(d) {
-  document.getElementById('rsub').textContent = (d.uploader?'@'+d.uploader+' · ':'')+d.items.length+' Medien';
-  const c = document.getElementById('rcontent');
-  c.innerHTML='';
-  if (!d.items.length) { c.innerHTML='<div style="text-align:center;color:#444;font-size:13px;padding:14px">Keine Medien. Cookies aktuell?</div>'; document.getElementById('res').classList.add('on'); return; }
-
-  if (_obs) _obs.disconnect();
-  _obs = new IntersectionObserver(entries => {
-    entries.forEach(e => {
-      const img=e.target.querySelector('img');
-      if (!img) return;
-      if (e.isIntersecting) { if(img.dataset.src) img.src=img.dataset.src; }
-      else if (Math.abs(e.boundingClientRect.top)>window.innerHeight*2.5 && img.dataset.src) img.src='';
-    });
-  },{rootMargin:'300px'});
-
-  const g=document.createElement('div'); g.className='mgrid';
-  d.items.forEach(item=>{
-    const div=document.createElement('div'); div.className='mitem';
-    div.innerHTML='<img data-src="'+(item.thumbnail||'')+'" src="" alt=""><div class="mov">↓</div>'+(item.type==='video'?'<div class="mvbadge">▶</div>':'');
-    div.onclick=()=>{ document.getElementById('uinp').value=item.url; sw(item.type==='video'?'video':'photo'); go(); };
-    g.appendChild(div); _obs.observe(div);
-  });
-  c.appendChild(g);
-  document.getElementById('res').classList.add('on');
-}
-
-// ── Cookies ────────────────────────────────────────────────────────
-async function initCookieStatus() {
-  try {
-    const r=await fetch(S+'/cookies/status');
-    const d=await r.json();
-    document.getElementById('cdot').classList.toggle('on',d.active);
-    document.getElementById('delbtn').style.display=d.active?'flex':'none';
-    document.getElementById('chkbtn').style.display=d.active?'flex':'none';
-  } catch {}
-}
-
-function openModal() { document.getElementById('mbg').classList.add('on'); }
-function closeModal() { document.getElementById('mbg').classList.remove('on'); }
-
-async function saveCookies() {
-  const v=document.getElementById('ctxt').value.trim();
-  if (!v) return;
-  try {
-    const r=await api('/cookies',{method:'POST',body:JSON.stringify({cookies:v})});
-    const d=await r.json();
-    if (d.ok) { closeModal(); initCookieStatus(); document.getElementById('ctxt').value=''; }
-  } catch(e) { alert(e.message); }
-}
-
-async function checkCookies() {
-  const el=document.getElementById('mstatus');
-  el.style.display='block'; el.textContent='Prüfe…'; el.style.color='#555';
-  try {
-    const r=await api('/cookies/check');
-    const d=await r.json();
-    el.style.color=d.ok?'#00e87a':'#ff3b3b';
-    el.textContent=d.msg;
-  } catch(e) { el.style.color='#ff3b3b'; el.textContent=e.message; }
-}
-
-async function delCookies() {
-  await api('/cookies',{method:'DELETE'});
-  closeModal(); initCookieStatus();
-}
-
-// ── UI ─────────────────────────────────────────────────────────────
-function setStat(t,type){
-  const el=document.getElementById('stat');
-  el.className='stat on '+type;
-  document.getElementById('stxt').textContent=t;
-  document.getElementById('spin').style.display=type==='loading'?'block':'none';
-}
-function hideStat(){ document.getElementById('stat').className='stat'; }
-function reset(){
-  document.getElementById('res').classList.remove('on');
-  document.getElementById('pvWrap').style.display='none';
-  document.getElementById('pvVideo').src='';
-  document.getElementById('pvVideo').style.display='none';
-  document.getElementById('pvThumb').style.display='block';
-  document.getElementById('pvPlay').classList.remove('hidden');
-  document.getElementById('rcontent').innerHTML='';
-  _previewUrl=null; _pvLoaded=false;
-  hideStat();
-  if(_obs){_obs.disconnect();_obs=null;}
 }
 </script>
 </body>
