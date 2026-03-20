@@ -16,7 +16,7 @@ const B2_APP_KEY = process.env.B2_APP_KEY;
 const B2_BUCKET = process.env.B2_BUCKET;
 const B2_BUCKET_ID = process.env.B2_BUCKET_ID;
 
-// B2 auth state
+// B2 auth state — lazy init
 let b2Auth = null;
 
 // Auto-load cookies
@@ -77,9 +77,16 @@ async function b2Authorize() {
 }
 
 async function getB2Auth() {
+  if (!B2_KEY_ID || !B2_APP_KEY) throw new Error('B2 nicht konfiguriert — Railway Variables prüfen');
   if (!b2Auth || Date.now() - b2Auth.time > 3600000) {
-    const auth = await b2Authorize();
-    b2Auth = { ...auth, time: Date.now() };
+    try {
+      const auth = await b2Authorize();
+      if (auth.status === 401) throw new Error('B2 Key ungültig');
+      b2Auth = { ...auth, time: Date.now() };
+    } catch(e) {
+      b2Auth = null;
+      throw new Error('B2 Auth fehlgeschlagen: ' + e.message);
+    }
   }
   return b2Auth;
 }
