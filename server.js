@@ -385,15 +385,10 @@ const HTML = `<!DOCTYPE html>
 :root{--bg:#000;--c1:#111;--c2:#181818;--bd:#1e1e1e;--tx:#fff;--sub:#444;--g:#00e87a;--r:#ff3b3b;--b:#4f8fff}
 html,body{background:var(--bg);color:var(--tx);font-family:'Geist',-apple-system,sans-serif;height:100dvh;overflow:hidden;-webkit-font-smoothing:antialiased}
 
-#splash{position:fixed;inset:0;background:#000;z-index:999;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;transition:opacity .7s,transform .7s}
-#splash.out{opacity:0;transform:scale(1.04);pointer-events:none}
-.sp-dev{font-size:9px;font-weight:600;color:#1a1a1a;letter-spacing:3.5px;text-transform:uppercase;opacity:0;animation:fi .5s .4s forwards}
-.sp-name{font-size:52px;font-weight:800;letter-spacing:-3px;line-height:1;color:#fff;opacity:0;animation:su .8s .7s cubic-bezier(.34,1.56,.64,1) forwards}
-.sp-bar{width:32px;height:1px;background:#111;margin-top:6px;overflow:hidden;opacity:0;animation:fi .3s 1.1s forwards}
-.sp-prog{height:100%;width:0;background:#fff;animation:pg 1.5s 1.2s cubic-bezier(.4,0,.2,1) forwards}
-@keyframes fi{to{opacity:1}}
-@keyframes su{from{opacity:0;transform:translateY(18px)}to{opacity:1;transform:none}}
-@keyframes pg{to{width:100%}}
+#splash{position:fixed;inset:0;background:#000;z-index:999;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;transition:opacity .4s}
+#splash.out{opacity:0;pointer-events:none}
+.sp-dev{font-size:9px;font-weight:600;color:#333;letter-spacing:3px;text-transform:uppercase}
+.sp-name{font-size:48px;font-weight:800;letter-spacing:-2px;line-height:1;color:#fff}
 
 #app{height:100dvh;display:flex;flex-direction:column;opacity:0;transition:opacity .5s}
 #app.on{opacity:1}
@@ -539,7 +534,6 @@ html,body{background:var(--bg);color:var(--tx);font-family:'Geist',-apple-system
 <div id="splash">
   <div class="sp-dev">matty dev</div>
   <div class="sp-name">XLoad</div>
-  <div class="sp-bar"><div class="sp-prog"></div></div>
 </div>
 
 <div id="app">
@@ -681,16 +675,11 @@ let _obs = null;
 let _currentUrl = null;
 
 window.addEventListener('load', () => {
-  // Show app after splash — wrapped in try/catch so errors don't block it
-  const showApp = () => {
+  setTimeout(() => {
     document.getElementById('splash').classList.add('out');
     document.getElementById('app').classList.add('on');
-  };
-  setTimeout(showApp, 2200);
-  // Fallback: force show after 4s no matter what
-  setTimeout(showApp, 4000);
-  
-  try { initStatus(); } catch(e) { console.error('initStatus:', e); }
+    try { initStatus(); } catch(e) {}
+  }, 1200);
 });
 
 (function(){
