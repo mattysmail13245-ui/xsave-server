@@ -214,6 +214,29 @@ app.get('/download', (req, res) => {
 });
 
 app.get('/health', (_, res) => res.json({ ok: true, cookies: fs.existsSync(COOKIES_PATH) }));
+
+// ── DEBUG — test yt-dlp with a tweet ─────────────────────────────
+app.get('/debug', async (req, res) => {
+  const url = req.query.url || 'https://x.com/elonmusk/status/1';
+  const base = ['--user-agent', UA, '--no-warnings', '--no-check-certificate'];
+  if (fs.existsSync(COOKIES_PATH)) base.push('--cookies', COOKIES_PATH);
+  
+  const { spawn } = require('child_process');
+  const args = [...base, '--dump-json', '--no-playlist', '--extractor-args', 'twitter:api=graphql', url];
+  
+  const proc = spawn('yt-dlp', args);
+  let out = '', err = '';
+  proc.stdout.on('data', d => out += d);
+  proc.stderr.on('data', d => err += d);
+  proc.on('close', code => {
+    res.json({
+      code,
+      error: err.slice(0, 500),
+      hasOutput: out.length > 0,
+      ytdlpArgs: args.filter(a => !a.includes('cookies')).join(' ')
+    });
+  });
+});
 app.get('/', (req, res) => { res.setHeader('Content-Type', 'text/html; charset=utf-8'); res.send(HTML); });
 app.listen(PORT, () => console.log(`XLoad v3 running on :${PORT} | cookies: ${fs.existsSync(COOKIES_PATH)}`));
 
